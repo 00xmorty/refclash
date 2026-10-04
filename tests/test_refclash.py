@@ -87,7 +87,10 @@ class RefClashTests(unittest.TestCase):
             subprocess.run(['git', 'init', '-q', tmp], check=True)
             env = dict(os.environ, GIT_AUTHOR_NAME='Fixture', GIT_AUTHOR_EMAIL='fixture@example.invalid',
                        GIT_COMMITTER_NAME='Fixture', GIT_COMMITTER_EMAIL='fixture@example.invalid')
+            # Prevent commit-triggered background maintenance racing the snapshot.
+            # Do not filter lock files: retain the full byte-for-byte assertion.
             subprocess.run(['git', '-C', tmp, '-c', 'core.hooksPath=/dev/null',
+                            '-c', 'gc.auto=0', '-c', 'maintenance.auto=false',
                             'commit', '--allow-empty', '-qm', 'fixture'], env=env, check=True)
             before = {str(p.relative_to(tmp)): p.read_bytes() for p in Path(tmp).rglob('*') if p.is_file()}
             result = subprocess.run([sys.executable, str(TOOL), '--repo', tmp, '--json'],
