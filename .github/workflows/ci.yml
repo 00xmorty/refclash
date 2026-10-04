@@ -1,0 +1,19 @@
+name: CI
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  test:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - name: Syntax and unit tests
+        run: |
+          mkdir -p "$RUNNER_TEMP/refclash-tmp"
+          export TMPDIR="$RUNNER_TEMP/refclash-tmp"
+          python3 -m py_compile refclash
+          python3 -m unittest discover -s tests -v
+          python3 refclash --repo . --json

@@ -1,0 +1,122 @@
+#!/usr/bin/env python3
+"""Read-only ASCII case and ref-prefix collision preflight."""
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+from urllib.parse import urlsplit
+
+LIMIT = 8 * 1024 * 1024
+FOLD = str.maketrans('ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz')
+
+
+def parse_refs(text):
+    refs = set()
+    if len(text.encode('utf-8')) > LIMIT:
+        raise ValueError('input exceeds 8 MiB')
+    for line in text.splitlines():
+        if not line:
+            continue
+        parts = line.split('\t')
+        if len(parts) != 2 or not re.fullmatch(r'[0-9a-fA-F]{40}|[0-9a-fA-F]{64}', parts[0]):
+            raise ValueError('invalid ref listing')
+        ref = parts[1]
+        if ref == 'HEAD' or ref.endswith('^{}'):
+            continue
+        if not ref.startswith(('refs/heads/', 'refs/tags/')):
+            continue
+        if (re.search(r'[\x00-\x20\x7f~^:?*\[\\]', ref)
+                or '..' in ref or '@{' in ref or ref.endswith('.')
+                or any(not p or p.startswith('.') or p.endswith('.lock') for p in ref.split('/'))):
+            raise ValueError('invalid ref name')
+        refs.add(ref)
+    return sorted(refs)
+
+
+def analyze(refs, show_names=False):
+    groups = {}
+    for ref in refs:
+        groups.setdefault(ref.translate(FOLD), []).append(ref)
+    findings = []
+    def add(kind, names):
+        item = {'kind': kind, 'ref_count': len(names)}
+        if show_names:
+            item['refs'] = sorted(names)
+        findings.append(item)
+    for key in sorted(groups):
+        names = groups[key]
+        if len(names) > 1:
+            add('ascii_case', names)
+        components = key.split('/')
+        for n in range(3, len(components)):
+            parent = '/'.join(components[:n])
+            if parent in groups:
+                add('directory_prefix', groups[parent] + names)
+    return {'schema_version': 1, 'status': 'RISK' if findings else 'NO_LISTED_COLLISION',
+            'refs_checked': len(refs),
+            'non_ascii_refs': sum(not r.isascii() for r in refs),
+            'findings': findings,
+            'scope': 'heads_and_tags_separately_ascii_only_not_fetch_guarantee'}
+
+
+def git_listing(args):
+    env = os.environ.copy()
+    env['GIT_TERMINAL_PROMPT'] = '0'
+    env['GIT_OPTIONAL_LOCKS'] = '0'
+    if args.remote:
+        url = urlsplit(args.remote)
+        if (url.scheme != 'https' or not url.hostname or url.username or url.password
+                or url.query or url.fragment or any(c.isspace() for c in args.remote)):
+            raise ValueError('remote must be a credential-free HTTPS URL')
+        command = ['git', '-c', 'credential.helper=', '-c', 'protocol.allow=never',
+                   '-c', 'protocol.https.allow=always', 'ls-remote', '--refs',
+                   args.remote, 'refs/heads/*', 'refs/tags/*']
+    else:
+        command = ['git', '-C', args.repo, 'for-each-ref',
+                   '--format=%(objectname)%09%(refname)', 'refs/heads', 'refs/tags']
+    result = subprocess.run(command, capture_output=True, timeout=30, env=env)
+    if result.returncode:
+        raise ValueError('Git query failed; details suppressed for privacy')
+    if len(result.stdout) > LIMIT:
+        raise ValueError('Git output exceeds 8 MiB')
+    return result.stdout.decode('utf-8', errors='strict')
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument('--repo', default='.', help='trusted local Git repository (default: .)')
+    mode.add_argument('--remote', help='explicit trusted public HTTPS repository URL')
+    mode.add_argument('--stdin', action='store_true', help='offline Git ref listing on stdin')
+    parser.add_argument('--show-names', action='store_true', help='opt in to potentially private ref names')
+    parser.add_argument('--json', action='store_true', help='machine-readable result')
+    args = parser.parse_args(argv)
+    try:
+        if args.stdin:
+            data = sys.stdin.buffer.read(LIMIT + 1)
+            if len(data) > LIMIT:
+                raise ValueError('input exceeds 8 MiB')
+            text = data.decode('utf-8', errors='strict')
+        else:
+            text = git_listing(args)
+        report = analyze(parse_refs(text), args.show_names)
+    except (ValueError, OSError, subprocess.SubprocessError, UnicodeError):
+        report = {'schema_version': 1, 'status': 'UNKNOWN',
+                  'error': 'query_or_input_failed', 'findings': []}
+    if args.json:
+        print(json.dumps(report, ensure_ascii=True, sort_keys=True))
+    else:
+        print('RefClash: ' + report['status'])
+        print('Scope: ASCII case + directory-prefix; not a fetch/clone guarantee.')
+        if 'refs_checked' in report:
+            print('Refs checked: %d; non-ASCII refs: %d' %
+                  (report['refs_checked'], report['non_ascii_refs']))
+        for item in report['findings']:
+            print(json.dumps(item, ensure_ascii=True, sort_keys=True))
+    return 1 if report['status'] == 'UNKNOWN' else 2 if report['findings'] else 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())
